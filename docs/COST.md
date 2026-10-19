@@ -2,6 +2,8 @@
 
 Last updated: 2026-10-19 · Companion to [DESIGN.md](DESIGN.md)
 
+> This is the **production** cost per client business. The MVP showcase runs on free tiers at $0/month; see DESIGN.md §1.1.
+
 This estimates what it costs **us** to run the voice booking agent for one UAE business in production: phone line, speech, AI and messaging. It is not the price we charge. All prices are in USD, with AED at 3.6725.
 
 > **Confidence.** Vendor prices come from public pricing pages and third-party summaries dated mid-to-late 2026. Several could not be confirmed on an official page (marked *unverified*). No UAE-specific call-volume data was found, so the volumes below are assumptions based on dental-practice benchmarks. Re-check against vendor consoles before quoting a client.

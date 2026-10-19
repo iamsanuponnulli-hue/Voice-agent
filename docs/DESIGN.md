@@ -16,16 +16,43 @@ All open questions were answered on 2026-10-19. This table is the source of trut
 | D2 | Business type | **Configurable per client**: one codebase, each business defined by config (services, staff, hours, FAQs, voice, greeting) |
 | D3 | Purpose | **Demo / showcase**, not production. Compliance work deferred until a paying client needs it |
 | D4 | Market | **UAE** prospects. Timezone `Asia/Dubai`, currency AED, phone numbers `+971` |
-| D5 | Channels | **Web (browser) at launch.** Phone in Phase 3 via a `+971` number from Telnyx once a company is registered. Twilio has no UAE voice numbers |
+| D5 | Channels | **Web (browser, WebRTC) only for the MVP.** No phone number. Phone comes after the first paying client, via a `+971` number from Telnyx (~$150/month). Twilio has no UAE voice numbers |
 | D6 | Language | **English at launch**; Arabic (Gulf) in Phase 4. Language is a config field from day one |
 | D7 | Model priority | **Best quality where it matters most: speech-to-text and voice.** Use a small, fast language model; booking needs reliable tool use, not deep reasoning (revised 2026-10-19) |
 | D8 | Framework | **LiveKit Agents** (Python) |
-| D9 | Hosting | **LiveKit Cloud** for media + **one small VM** for agent worker, API, database, dashboard |
+| D9 | Hosting | **Zero-cost MVP** (§1.1): LiveKit Cloud free tier for media + **Oracle Cloud Always Free** Arm VM for agent worker, API, database, dashboard |
 | D10 | Appointment storage | **Built-in Postgres database** with our own scheduling logic (no external calendar) |
-| D11 | Confirmation | **WhatsApp** message after booking/reschedule/cancel (Twilio WhatsApp; Sandbox until a company is registered) |
-| D12 | Recording | **Yes**, audio recorded with a short notice in the greeting; playback in the dashboard |
+| D11 | Confirmation | **WhatsApp** message after booking/reschedule/cancel. MVP: Meta WhatsApp Cloud API **test number** (free, up to 5 registered recipients), plus a message preview in the dashboard |
+| D12 | Recording | **Yes**, audio recorded with a short notice in the greeting; playback in the dashboard. MVP: recorded by the agent worker to VM disk (no paid egress or storage) |
 | D13 | Showcase UI | **Admin dashboard**, including a "Try the agent" page (the web channel) |
 | D14 | Company / KYC | **None yet**: everything in Phases 1–2 works without a registered company |
+
+### 1.1 Zero-cost MVP profile
+
+The MVP exists to show prospects; it must cost **$0 per month** to keep running. Every paid component is replaced by a free tier or a startup credit, behind the same interfaces, so production swaps are config changes.
+
+| Component | MVP (free) | Production upgrade |
+|---|---|---|
+| Media / WebRTC | LiveKit Cloud **Build (free)** plan: 5,000 WebRTC participant minutes and 1,000 agent session minutes per month. A self-hosted agent counts against WebRTC minutes; each call uses 2 participants, so ~2,500 call minutes/month, about 800 demo calls | LiveKit paid plan, or self-hosted LiveKit server |
+| Server | **Oracle Cloud Always Free** Ampere A1 Arm VM in `us-ashburn-1`. Plan for 2 OCPU / 12 GB, the allowance reported since mid-2026; 4 OCPU / 24 GB if the account still gets it. Runs agent, API, Postgres, dashboard | Paid VM (~$25/month) |
+| Fallback server | Your laptop + Cloudflare Tunnel (free), for live demos if Oracle capacity is unavailable | — |
+| Speech-to-text | **Deepgram Flux** on Deepgram's **$200 free signup credit** (no card) | Same, pay-as-you-go |
+| Text-to-speech | **Deepgram Aura-2** on the same credit (~$0.03 per 1k characters) | **ElevenLabs** for the most natural voice; switch on for important demos with a $5 one-month plan |
+| Language model | **Claude Haiku 5.5**. Not free, but ~$0.003 per call minute, so a single $5 API top-up covers ~1,600 call minutes | Same |
+| WhatsApp | Meta WhatsApp Cloud API **test number**: free, no business verification, up to 5 recipients who confirm a code. The dashboard also shows a preview of every confirmation, so prospects not on the list still see it | Verified WhatsApp Business sender (needs a registered company) |
+| Recording storage | Agent worker mixes caller + agent audio to OGG on VM disk (200 GB block storage is in Always Free) | Cloudflare R2 / S3 |
+| Domain + TLS | Free DuckDNS subdomain + Caddy (Let's Encrypt) | Own domain |
+| Error tracking | Sentry free tier | Same |
+
+**What the free credits buy.** Deepgram STT ($0.008/min) plus Aura-2 TTS (~360 characters per call minute ≈ $0.011) comes to about $0.019 per call minute. The $200 credit therefore covers ~10,000 call minutes, about **3,000+ demo calls**. The binding limit is LiveKit's free WebRTC minutes (~800 calls/month), far above demo needs.
+
+**Total MVP cost:** $0/month recurring, plus a one-time ~$5 Anthropic API top-up. Evals add ~$1–3 per full 25-scenario run, so run them on prompt changes only.
+
+**Risks specific to the free profile:**
+- Oracle Always Free Arm capacity is often "out of capacity" in popular regions; retry, or use the laptop fallback.
+- Verify on day 1 that the LiveKit Agents, Silero and turn-detector wheels install on Linux `aarch64`.
+- LiveKit Cloud enhanced noise cancellation may need a paid plan; MVP runs without it if so.
+- Free-tier terms change; all limits above were checked on 2026-10-19 from third-party summaries and need confirming on sign-up.
 
 ## 2. Scope
 
@@ -52,7 +79,7 @@ All open questions were answered on 2026-10-19. This table is the source of trut
 |---|---|---|---|
 | Language model | **Claude Haiku 5.5** (`claude-haiku-5-5`), `effort: "low"`, streaming, prompt caching | Booking is a narrow task: understand intent, call a few tools, confirm. Haiku is the fastest current model (lowest time to first token, which matters most in voice) and ~40× cheaper than Opus | Quality gate (§13): if Haiku fails the eval suite, switch the turn model to **Claude Sonnet 5.5** (`claude-sonnet-5-5`, `effort: "low"`); config change only |
 | Speech-to-text | **Deepgram Flux** (streaming, English) | Built for voice agents: native end-of-turn events, low latency, keyterm boosting for service and staff names | AssemblyAI Universal-Streaming |
-| Text-to-speech | **ElevenLabs**, latest low-latency model (Flash family) | Most natural voices in independent rankings; strong Arabic for Phase 4 | Cartesia Sonic (lowest time-to-first-audio) |
+| Text-to-speech | MVP: **Deepgram Aura-2** (free credit). Upgrade: **ElevenLabs**, latest low-latency model (Flash family) | Aura-2 is free under the credit and shares a vendor with STT. ElevenLabs has the most natural voices in independent rankings and strong Arabic for Phase 4 | Cartesia Sonic (lowest time-to-first-audio) |
 | Voice activity detection | **Silero VAD** (LiveKit plugin) | Small, runs on CPU in the worker | — |
 | End-of-turn detection | **LiveKit turn-detector model** + Flux end-of-turn events | Decides whether the caller has finished speaking from the words, not only the silence | Silence-only (700 ms) |
 | Noise cancellation | **LiveKit Cloud enhanced noise cancellation** | Removes background noise and other voices before speech-to-text | — |
@@ -85,16 +112,16 @@ Vendor rankings for speech-to-text and text-to-speech come mostly from vendor-pu
   ┌───────────────────────┐   WebRTC audio    ┌──────────────────────────┐
   │ Dashboard (Next.js)   │◄─────────────────►│  Room per conversation   │
   │  "Try the agent" page │                   │  noise cancellation      │
-  └──────────┬────────────┘                   │  Egress → recording      │
+  └──────────┬────────────┘                   │  (free Build plan)       │
              │ HTTPS                          └────────────┬─────────────┘
              ▼                                             │ WebRTC (agent joins room)
-  ┌─────────────────────────── One VM (Docker Compose, US-East) ─────────────────────────┐
+  ┌─────────────────────────── Oracle Always Free VM ─────────────────────────────────┐
   │                                                        ▼                             │
   │  ┌──────────────┐   dispatch    ┌───────────────────────────────────────────────┐   │
   │  │ API (FastAPI)│──────────────►│ Agent worker (LiveKit Agents, Python)         │   │
   │  │ - auth       │               │  Silero VAD → Deepgram Flux → turn detector   │   │
-  │  │ - room tokens│◄──tool calls──│       → Claude (custom llm_node) → ElevenLabs │   │
-  │  │ - scheduling │   (HTTP)      │  barge-in, fillers, event log, latency stamps │   │
+  │  │ - room tokens│◄──tool calls──│       → Claude (custom llm_node) → Aura-2     │   │
+  │  │ - scheduling │   (HTTP)      │  barge-in, fillers, recording, latency stamps │   │
   │  │ - config CRUD│               └───────────────────────────────────────────────┘   │
   │  │ - WhatsApp   │                                                                    │
   │  └──────┬───────┘                                                                    │
@@ -103,10 +130,10 @@ Vendor rankings for speech-to-text and text-to-speech come mostly from vendor-pu
   │  │ Postgres 16  │   │ Caddy (TLS)  │                                                 │
   │  └──────────────┘   └──────────────┘                                                 │
   └──────────────────────────────────────────────────────────────────────────────────────┘
-       External: Anthropic API · Deepgram · ElevenLabs · Twilio (WhatsApp) · Cloudflare R2 (recordings)
+       External: Anthropic API · Deepgram (STT + TTS) · Meta WhatsApp Cloud API
 ```
 
-**Why US-East for the VM.** Anthropic, Deepgram and ElevenLabs all serve from US regions. Putting the agent next to them keeps the three per-turn vendor calls fast; the UAE↔US distance is paid once on the audio path (~200–250 ms round trip) instead of on every vendor hop. Phase 3 re-measures an EU region.
+**Why US-East for the VM** (Oracle `us-ashburn-1`). Anthropic, Deepgram and ElevenLabs all serve from US regions. Putting the agent next to them keeps the three per-turn vendor calls fast; the UAE↔US distance is paid once on the audio path (~200–250 ms round trip) instead of on every vendor hop. Phase 3 re-measures an EU region.
 
 **Agent logic calls the API for every tool.** The agent worker holds no business logic. Scheduling rules live in the API, so the dashboard and agent can never disagree, and the logic can be tested without audio.
 
@@ -116,7 +143,7 @@ Vendor rankings for speech-to-text and text-to-speech come mostly from vendor-pu
 
 1. The browser asks the API for a room token: `POST /api/demo/{business_slug}/session`.
 2. The API creates the `call` row and returns the token plus room name. It dispatches the agent with metadata `{business_id, config_version, call_id, channel: "web"}`.
-3. The agent loads the business config, starts recording (LiveKit Egress, audio only) and plays the greeting immediately, before any LLM call (pre-rendered and cached per config version):
+3. The agent loads the business config, starts recording (the worker writes caller + agent audio to a local OGG file) and plays the greeting immediately, before any LLM call (pre-rendered and cached per config version):
    > "Hi, thanks for calling Bright Smile Dental. Just so you know, this call is recorded. How can I help you today?"
 
 ### 5.2 Booking flow (happy path)
@@ -234,7 +261,7 @@ Measured from the caller stopping speaking to the first agent audio heard in a U
 | End-of-turn decision | 300 ms |
 | STT final (overlaps end-of-turn) | 50 ms |
 | Claude time to first sentence (Haiku, cached prompt) | 300 ms |
-| ElevenLabs time to first audio | 150 ms |
+| TTS time to first audio (Aura-2 / ElevenLabs) | 150 ms |
 | UAE ↔ US audio path (both directions) | 230 ms |
 | **Total** | **≈ 1.0 s** |
 
@@ -246,13 +273,13 @@ Every turn writes latency stamps into `call_event`, so the dashboard shows the r
 
 ## 10. WhatsApp confirmations
 
-- Twilio WhatsApp API. **Until a company is registered: Twilio WhatsApp Sandbox.** Recipients first send the sandbox join code, which suits demos to prospects on their own phones. After registration: a Meta-verified WhatsApp Business sender with approved templates.
+- **MVP: Meta WhatsApp Cloud API test number** (free). Up to 5 recipients, each confirming a code once; add your own phone and the prospect's for a live demo. Send free-form text inside the 24-hour window opened when the recipient messages the test number; otherwise use the `hello_world` template. The access token expires after 24 hours, so create a permanent System User token. Every confirmation is also shown in the dashboard. **After company registration:** a Meta-verified WhatsApp Business sender with approved templates.
 - Template (utility): "Hi {name}, your {service} with {staff} at {business} is confirmed for {day, date} at {time}. To change it, just call us back." Similar templates for rescheduled and cancelled.
 - Sent asynchronously by the API after commit; result stored in `notification`. A failure never affects the call.
 
 ## 11. Recording, data and privacy (demo level)
 
-- Greeting includes the recording notice (D12). Recording: LiveKit Egress, audio only, OGG to Cloudflare R2 (private bucket). Played back in the dashboard through short-lived signed URLs.
+- Greeting includes the recording notice (D12). Recording: the agent worker mixes both audio tracks to OGG on the VM's disk (MVP). It is played back in the dashboard through short-lived signed URLs served by the API. Production moves to LiveKit Egress + R2.
 - Secrets live in `.env` on the VM, never in the repo. The dashboard is HTTPS only, through Caddy.
 - Retention: recordings and transcripts are deleted after 30 days by a nightly job. Prospects' demo data can be wiped per business.
 - Deferred to production: UAE PDPL review, DHA/DOH rules for clinics, data residency in the UAE, consent records, PII redaction.
@@ -263,7 +290,7 @@ Every turn writes latency stamps into `call_event`, so the dashboard shows the r
 |---|---|
 | Claude slow (> 2.5 s to first token) or 5xx | Play filler, retry once on `claude-sonnet-5-5`; then "Sorry, I'm having trouble — can I take a message?" |
 | Refusal (`stop_reason: "refusal"`) | Retry the turn once on `claude-sonnet-5-5`; if it still refuses, steer back to booking |
-| Deepgram / ElevenLabs error | LiveKit `FallbackAdapter` → AssemblyAI / Cartesia |
+| Speech-to-text / text-to-speech error | MVP: retry once, then apologise and take a message. Production: LiveKit `FallbackAdapter` → AssemblyAI / Cartesia |
 | Tool / API error | Model receives `is_error` result and apologises; never invents a booking |
 | `slot_taken` | Offer the 2 alternatives returned |
 | WhatsApp send fails | Logged; dashboard shows "not delivered"; call unaffected |
@@ -314,15 +341,17 @@ voice-agent/
 ## 15. Environments and cost
 
 - **Local dev**: `docker compose up` (Postgres, API, dashboard) + `uv run agent/main.py dev` against a LiveKit Cloud dev project.
-- **Demo server**: one VM (2 vCPU / 4 GB, Ubuntu 24.04, US-East, e.g. Hetzner Ashburn or DigitalOcean NYC) running Docker Compose; deploy by `make deploy` (rsync + `docker compose up -d`). Domain with HTTPS through Caddy.
+- **Demo server**: Oracle Cloud Always Free Ampere A1 VM (2 OCPU / 12 GB, Ubuntu 24.04 Arm, `us-ashburn-1`) running Docker Compose. Fallback: laptop + Cloudflare Tunnel. deploy by `make deploy` (rsync + `docker compose up -d`). Domain with HTTPS through Caddy.
 - **Estimated running cost** (to be verified against live pricing):
-  - Fixed: VM ~$10–25/month; LiveKit Cloud, Sentry and R2 on free tiers at demo volume.
-  - Per conversation minute, about $0.044 all-in (ElevenLabs is the largest share, then Deepgram; Claude Haiku 5.5 is ~$0.003). Full per-business daily estimate in [COST.md](COST.md).
+  - MVP: **$0/month**. Free tiers and credits per §1.1, plus a one-time ~$5 Anthropic top-up.
+  - Production: VM ~$25/month, LiveKit plan, phone number.
+  - Production, per conversation minute: about $0.044 all-in (ElevenLabs is the largest share, then Deepgram; Claude Haiku 5.5 is ~$0.003). Full per-business daily estimate in [COST.md](COST.md).
 
 ## 16. Roadmap and acceptance criteria
 
 **Phase 1 — Talking skeleton (week 1–2)**
-- Agent in a LiveKit room with Flux → Claude → ElevenLabs, barge-in, greeting, end of call; plain test page.
+- Sign up for the free tiers (§1.1) and check the Arm VM installs.
+- Agent in a LiveKit room with Flux → Claude Haiku → Aura-2, barge-in, greeting, end of call; plain test page.
 - Speech-to-text and text-to-speech bake-off; latency gate (§9).
 - ✅ Done when: a 3-minute conversation works with p50 ≤ 1.4 s and barge-in works reliably.
 
