@@ -18,7 +18,7 @@ All open questions were answered on 2026-10-19. This table is the source of trut
 | D4 | Market | **UAE** prospects. Timezone `Asia/Dubai`, currency AED, phone numbers `+971` |
 | D5 | Channels | **Web (browser) at launch.** Phone in Phase 3 via a `+971` number from Telnyx once a company is registered. Twilio has no UAE voice numbers |
 | D6 | Language | **English at launch**; Arabic (Gulf) in Phase 4. Language is a config field from day one |
-| D7 | Model priority | **Best quality** while keeping conversation latency acceptable |
+| D7 | Model priority | **Best quality where it matters most: speech-to-text and voice.** Use a small, fast language model; booking needs reliable tool use, not deep reasoning (revised 2026-10-19) |
 | D8 | Framework | **LiveKit Agents** (Python) |
 | D9 | Hosting | **LiveKit Cloud** for media + **one small VM** for agent worker, API, database, dashboard |
 | D10 | Appointment storage | **Built-in Postgres database** with our own scheduling logic (no external calendar) |
@@ -50,23 +50,30 @@ All open questions were answered on 2026-10-19. This table is the source of trut
 
 | Stage | Choice | Why | Fallback |
 |---|---|---|---|
-| Language model | **Claude Opus 5.5** (`claude-opus-5-5`), `effort: "low"`, adaptive thinking, streaming, prompt caching, fast mode (`speed: "fast"`) if the account has access | Highest-quality reasoning and tool use; low effort and caching keep time-to-first-token down for conversation | Latency gate (§9): if Phase 1 measures p50 time-to-first-token > 600 ms, switch the turn model to **Claude Sonnet 5.5** (`claude-sonnet-5-5`, `effort: "low"`). Refusals: server-side `fallbacks: "default"` |
+| Language model | **Claude Haiku 5.5** (`claude-haiku-5-5`), `effort: "low"`, streaming, prompt caching | Booking is a narrow task: understand intent, call a few tools, confirm. Haiku is the fastest current model (lowest time to first token, which matters most in voice) and ~40× cheaper than Opus | Quality gate (§13): if Haiku fails the eval suite, switch the turn model to **Claude Sonnet 5.5** (`claude-sonnet-5-5`, `effort: "low"`); config change only |
 | Speech-to-text | **Deepgram Flux** (streaming, English) | Built for voice agents: native end-of-turn events, low latency, keyterm boosting for service and staff names | AssemblyAI Universal-Streaming |
 | Text-to-speech | **ElevenLabs**, latest low-latency model (Flash family) | Most natural voices in independent rankings; strong Arabic for Phase 4 | Cartesia Sonic (lowest time-to-first-audio) |
 | Voice activity detection | **Silero VAD** (LiveKit plugin) | Small, runs on CPU in the worker | — |
 | End-of-turn detection | **LiveKit turn-detector model** + Flux end-of-turn events | Decides whether the caller has finished speaking from the words, not only the silence | Silence-only (700 ms) |
 | Noise cancellation | **LiveKit Cloud enhanced noise cancellation** | Removes background noise and other voices before speech-to-text | — |
 | Eval: simulated caller | `claude-sonnet-5-5` | Cheap and capable enough to play a caller | — |
-| Eval: judge | `claude-opus-5-5`, `effort: "high"` | Grading needs the strongest judgement | — |
+| Eval: judge | `claude-opus-5-5`, `effort: "high"` | Grading runs offline, so it can use the strongest model | — |
 
 Vendor rankings for speech-to-text and text-to-speech come mostly from vendor-published benchmarks. Phase 1 includes a bake-off on our own recorded test phrases (UAE-accented English, names, phone numbers) before the choice is final.
 
-**How the Claude call is made.** Use a custom `llm_node` in LiveKit Agents that calls the **official `anthropic` Python SDK** directly, not the generic LiveKit plugin, so we control effort, fast mode, caching, fallbacks and tool streaming:
+**Speech is where accuracy is spent.** Mishearing a name or phone number, or a robotic voice, ruins a demo more than any reasoning gap. That is why speech-to-text and text-to-speech use top-tier vendors, while the language model is the smallest one that passes the eval suite.
 
-- `client.beta.messages.stream(...)` with `model="claude-opus-5-5"`, `max_tokens=1024`, `output_config={"effort": "low"}`. No `thinking` field: adaptive thinking is the default, and Opus 5.5 rejects disabling it.
-- Fast mode: `speed="fast"`, `betas=["fast-mode-2026-02-01", "server-side-fallback-2026-07-01"]`. On a fast-mode 429, drop `speed`. This costs one cache miss.
-- Refusal fallback: `fallbacks="default"`. Always check `stop_reason` before speaking.
-- Tools: `strict: true` and `eager_input_streaming: true`. Validate each tool input against its schema before running it. `tool_choice` stays `auto`, because forced tool choice is a 400 on Opus 5.5.
+**Keep the model's job small.** The code does the hard parts, so a small model is enough:
+- The dynamic system message lists today's date and the next 14 days with weekday names ("Tue 21 Oct"). The model never calculates dates.
+- `check_availability` does all slot logic.
+- The side-effect guard (§6) enforces confirmation.
+- The API sends WhatsApp confirmations.
+
+**How the Claude call is made.** Use a custom `llm_node` in LiveKit Agents that calls the **official `anthropic` Python SDK** directly, not the generic LiveKit plugin, so we control effort, caching, refusal handling and tool streaming:
+
+- `client.messages.stream(...)` with `model` taken from config (default `"claude-haiku-5-5"`), `max_tokens=1024`, `output_config={"effort": "low"}`, and adaptive thinking (the default). Effort `low` keeps thinking minimal; raise it only if evals show reasoning errors.
+- Refusals: Haiku 5.5 has no server-side fallback. On `stop_reason: "refusal"`, retry the turn once on `claude-sonnet-5-5`. Always check `stop_reason` before speaking.
+- Tools: `strict: true` and `eager_input_streaming: true`. Validate each tool input against its schema before running it. `tool_choice` stays `auto`.
 - Prompt caching: tools and system prompt are byte-stable per business and version. Put a `cache_control` breakpoint after the system prompt and another on the latest turn. Dynamic facts (today's date, the caller's known details) go in a mid-conversation `system` message, never in the top-level system prompt. Confirm `usage.cache_read_input_tokens > 0` from turn 2.
 - History is append-only: the full `response.content` goes back each turn. When the caller interrupts, add a short note to the next user turn saying which sentence they actually heard. Never edit earlier assistant messages, because preserved thinking rejects edited history.
 - Text the model writes between tool calls comes back as hidden `thinking` blocks, so the agent does not speak it. Fillers such as "One moment, let me check that" are played by the orchestrator (§5.4).
@@ -226,16 +233,14 @@ Measured from the caller stopping speaking to the first agent audio heard in a U
 |---|---|
 | End-of-turn decision | 300 ms |
 | STT final (overlaps end-of-turn) | 50 ms |
-| Claude time to first sentence (cached prompt) | 400 ms |
+| Claude time to first sentence (Haiku, cached prompt) | 300 ms |
 | ElevenLabs time to first audio | 150 ms |
 | UAE ↔ US audio path (both directions) | 230 ms |
-| **Total** | **≈ 1.1 s** |
+| **Total** | **≈ 1.0 s** |
 
 **Targets**: p50 ≤ 1.2 s, p95 ≤ 2.0 s, barge-in stop ≤ 250 ms.
 
-**Latency gate (end of Phase 1).** Run 50 scripted turns. Then:
-- If Claude's p50 time to first token is over 600 ms with caching and fast mode, switch the turn model to `claude-sonnet-5-5`.
-- If total p50 is over 1.4 s, try an EU-region VM and Cartesia for text-to-speech.
+**Latency gate (end of Phase 1).** Run 50 scripted turns. If total p50 is over 1.4 s, try an EU-region VM and Cartesia for text-to-speech. The model is not expected to be the bottleneck with Haiku.
 
 Every turn writes latency stamps into `call_event`, so the dashboard shows the real numbers.
 
@@ -256,8 +261,8 @@ Every turn writes latency stamps into `call_event`, so the dashboard shows the r
 
 | Failure | Behaviour |
 |---|---|
-| Claude slow (> 2.5 s to first token) or 5xx | Play filler, retry once without fast mode, then once on `claude-sonnet-5-5`; then "Sorry, I'm having trouble — can I take a message?" |
-| Refusal (`stop_reason: "refusal"`) | Server-side fallback; if it still refuses, steer back to booking |
+| Claude slow (> 2.5 s to first token) or 5xx | Play filler, retry once on `claude-sonnet-5-5`; then "Sorry, I'm having trouble — can I take a message?" |
+| Refusal (`stop_reason: "refusal"`) | Retry the turn once on `claude-sonnet-5-5`; if it still refuses, steer back to booking |
 | Deepgram / ElevenLabs error | LiveKit `FallbackAdapter` → AssemblyAI / Cartesia |
 | Tool / API error | Model receives `is_error` result and apologises; never invents a booking |
 | `slot_taken` | Offer the 2 alternatives returned |
@@ -278,6 +283,7 @@ Every turn writes latency stamps into `call_event`, so the dashboard shows the r
   4. concise, spoken style;
   5. latency within target.
 - Run on every prompt or config change. Gate: ≥ 90% pass, no hallucination failures.
+- **Model quality gate (Phase 2):** run the suite on `claude-haiku-5-5` and `claude-sonnet-5-5`. Keep Haiku unless it misses the gate. Sonnet is the default fallback, and the turn model is a single config value.
 
 ## 14. Repository layout
 
@@ -311,7 +317,7 @@ voice-agent/
 - **Demo server**: one VM (2 vCPU / 4 GB, Ubuntu 24.04, US-East, e.g. Hetzner Ashburn or DigitalOcean NYC) running Docker Compose; deploy by `make deploy` (rsync + `docker compose up -d`). Domain with HTTPS through Caddy.
 - **Estimated running cost** (to be verified against live pricing):
   - Fixed: VM ~$10–25/month; LiveKit Cloud, Sentry and R2 on free tiers at demo volume.
-  - Per conversation minute, roughly $0.06–0.15 (ElevenLabs is the largest share, then Deepgram and Claude). Claude stays cheap thanks to cache reads at $0.20 per million tokens.
+  - Per conversation minute, roughly $0.05–0.13 (ElevenLabs is the largest share, then Deepgram). Claude Haiku 5.5 adds well under $0.01 per minute.
 
 ## 16. Roadmap and acceptance criteria
 
@@ -335,7 +341,7 @@ voice-agent/
 | Risk | Mitigation |
 |---|---|
 | Browser voice (WebRTC) blocked or degraded on some UAE networks | Test on e& and du mobile data and home broadband in Phase 1; LiveKit falls back to TURN over TLS on port 443. If still blocked, prioritise Phase 3 (phone) |
-| Opus 5.5 too slow for conversation | Latency gate switches to Sonnet 5.5 with no other changes |
+| Haiku 5.5 makes booking mistakes (dates, skipped confirmation) | Dates computed in code, side-effect guard, eval gate; switch to Sonnet 5.5 by config |
 | Speech-to-text gets UAE names and accents wrong | Keyterm boosting from staff and service names; always read back name and number; bake-off on accented samples |
 | WhatsApp Sandbox needs recipients to opt in first | Explain in the demo script; register a business sender after company registration |
 | Twilio cannot provide UAE voice numbers | Phase 3 uses Telnyx (or a local e&/du SIP trunk) |
