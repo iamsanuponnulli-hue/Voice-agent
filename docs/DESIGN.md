@@ -317,7 +317,7 @@ voice-agent/
 - **Demo server**: one VM (2 vCPU / 4 GB, Ubuntu 24.04, US-East, e.g. Hetzner Ashburn or DigitalOcean NYC) running Docker Compose; deploy by `make deploy` (rsync + `docker compose up -d`). Domain with HTTPS through Caddy.
 - **Estimated running cost** (to be verified against live pricing):
   - Fixed: VM ~$10–25/month; LiveKit Cloud, Sentry and R2 on free tiers at demo volume.
-  - Per conversation minute, roughly $0.05–0.13 (ElevenLabs is the largest share, then Deepgram). Claude Haiku 5.5 adds well under $0.01 per minute.
+  - Per conversation minute, about $0.044 all-in (ElevenLabs is the largest share, then Deepgram; Claude Haiku 5.5 is ~$0.003). Full per-business daily estimate in [COST.md](COST.md).
 
 ## 16. Roadmap and acceptance criteria
 
