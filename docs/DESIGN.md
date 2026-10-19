@@ -1,251 +1,341 @@
-# Voice Agent System — Design
+# Voice Booking Agent — Design Spec
 
-Status: Draft v0.1 · Owner: TBD · Last updated: 2026-10-19
+Status: **v1.0 — decisions locked** · Last updated: 2026-10-19
 
-## 1. Goal
+A voice agent that answers customers, checks availability, and books, reschedules or cancels appointments for a small business. It is built as a **showcase for prospective clients in the UAE**: each prospect gets their own re-skinned agent (their business name, services, staff, hours) that they can talk to in the browser, then watch the booking, transcript and recording appear in an admin dashboard.
 
-A real-time conversational voice agent that people can talk to over a **phone call** or a **browser/mobile app**. It listens, understands, takes actions through tools (look up an order, book a slot, answer from a knowledge base), and talks back naturally — fast enough that it feels like a conversation, and able to be interrupted mid-sentence.
+---
 
-### Requirements
+## 1. Decisions
 
-| Area | Target |
+All open questions were answered on 2026-10-19. This table is the source of truth; the rest of the document follows from it.
+
+| # | Question | Decision |
+|---|---|---|
+| D1 | Use case | **Appointment booking**: book, reschedule, cancel, answer questions about services, prices, hours, location |
+| D2 | Business type | **Configurable per client**: one codebase, each business defined by config (services, staff, hours, FAQs, voice, greeting) |
+| D3 | Purpose | **Demo / showcase**, not production. Compliance work deferred until a paying client needs it |
+| D4 | Market | **UAE** prospects. Timezone `Asia/Dubai`, currency AED, phone numbers `+971` |
+| D5 | Channels | **Web (browser) at launch.** Phone in Phase 3 via a `+971` number from Telnyx once a company is registered. Twilio has no UAE voice numbers |
+| D6 | Language | **English at launch**; Arabic (Gulf) in Phase 4. Language is a config field from day one |
+| D7 | Model priority | **Best quality** while keeping conversation latency acceptable |
+| D8 | Framework | **LiveKit Agents** (Python) |
+| D9 | Hosting | **LiveKit Cloud** for media + **one small VM** for agent worker, API, database, dashboard |
+| D10 | Appointment storage | **Built-in Postgres database** with our own scheduling logic (no external calendar) |
+| D11 | Confirmation | **WhatsApp** message after booking/reschedule/cancel (Twilio WhatsApp; Sandbox until a company is registered) |
+| D12 | Recording | **Yes**, audio recorded with a short notice in the greeting; playback in the dashboard |
+| D13 | Showcase UI | **Admin dashboard**, including a "Try the agent" page (the web channel) |
+| D14 | Company / KYC | **None yet**: everything in Phases 1–2 works without a registered company |
+
+## 2. Scope
+
+### In scope (v1 demo)
+
+- Talk to the agent in the browser, with interruptions handled naturally.
+- The agent can book, reschedule and cancel appointments, check availability, and answer FAQs from the business config.
+- Real-time availability from our own database, with no double bookings.
+- WhatsApp confirmation to the customer's number.
+- Admin dashboard: bookings calendar, call list with transcript, recording and per-turn latency, business config editor, "Try the agent" page.
+- Multiple businesses (one per prospect), each with a shareable demo link.
+
+### Out of scope (v1)
+
+- Phone calls (Phase 3), Arabic (Phase 4).
+- Payments, deposits, insurance checks.
+- Outbound calls and reminder calls.
+- Compliance work (UAE PDPL, health-data rules), SSO, multi-user roles. A single admin login is enough.
+- Syncing with external calendars (Google, Outlook).
+
+## 3. Model and vendor choices
+
+| Stage | Choice | Why | Fallback |
+|---|---|---|---|
+| Language model | **Claude Opus 5.5** (`claude-opus-5-5`), `effort: "low"`, adaptive thinking, streaming, prompt caching, fast mode (`speed: "fast"`) if the account has access | Highest-quality reasoning and tool use; low effort and caching keep time-to-first-token down for conversation | Latency gate (§9): if Phase 1 measures p50 time-to-first-token > 600 ms, switch the turn model to **Claude Sonnet 5.5** (`claude-sonnet-5-5`, `effort: "low"`). Refusals: server-side `fallbacks: "default"` |
+| Speech-to-text | **Deepgram Flux** (streaming, English) | Built for voice agents: native end-of-turn events, low latency, keyterm boosting for service and staff names | AssemblyAI Universal-Streaming |
+| Text-to-speech | **ElevenLabs**, latest low-latency model (Flash family) | Most natural voices in independent rankings; strong Arabic for Phase 4 | Cartesia Sonic (lowest time-to-first-audio) |
+| Voice activity detection | **Silero VAD** (LiveKit plugin) | Small, runs on CPU in the worker | — |
+| End-of-turn detection | **LiveKit turn-detector model** + Flux end-of-turn events | Decides whether the caller has finished speaking from the words, not only the silence | Silence-only (700 ms) |
+| Noise cancellation | **LiveKit Cloud enhanced noise cancellation** | Removes background noise and other voices before speech-to-text | — |
+| Eval: simulated caller | `claude-sonnet-5-5` | Cheap and capable enough to play a caller | — |
+| Eval: judge | `claude-opus-5-5`, `effort: "high"` | Grading needs the strongest judgement | — |
+
+Vendor rankings for speech-to-text and text-to-speech come mostly from vendor-published benchmarks. Phase 1 includes a bake-off on our own recorded test phrases (UAE-accented English, names, phone numbers) before the choice is final.
+
+**How the Claude call is made.** Use a custom `llm_node` in LiveKit Agents that calls the **official `anthropic` Python SDK** directly, not the generic LiveKit plugin, so we control effort, fast mode, caching, fallbacks and tool streaming:
+
+- `client.beta.messages.stream(...)` with `model="claude-opus-5-5"`, `max_tokens=1024`, `output_config={"effort": "low"}`. No `thinking` field: adaptive thinking is the default, and Opus 5.5 rejects disabling it.
+- Fast mode: `speed="fast"`, `betas=["fast-mode-2026-02-01", "server-side-fallback-2026-07-01"]`. On a fast-mode 429, drop `speed`. This costs one cache miss.
+- Refusal fallback: `fallbacks="default"`. Always check `stop_reason` before speaking.
+- Tools: `strict: true` and `eager_input_streaming: true`. Validate each tool input against its schema before running it. `tool_choice` stays `auto`, because forced tool choice is a 400 on Opus 5.5.
+- Prompt caching: tools and system prompt are byte-stable per business and version. Put a `cache_control` breakpoint after the system prompt and another on the latest turn. Dynamic facts (today's date, the caller's known details) go in a mid-conversation `system` message, never in the top-level system prompt. Confirm `usage.cache_read_input_tokens > 0` from turn 2.
+- History is append-only: the full `response.content` goes back each turn. When the caller interrupts, add a short note to the next user turn saying which sentence they actually heard. Never edit earlier assistant messages, because preserved thinking rejects edited history.
+- Text the model writes between tool calls comes back as hidden `thinking` blocks, so the agent does not speak it. Fillers such as "One moment, let me check that" are played by the orchestrator (§5.4).
+
+## 4. Architecture
+
+```
+  Prospect's browser                           LiveKit Cloud (nearest edge)
+  ┌───────────────────────┐   WebRTC audio    ┌──────────────────────────┐
+  │ Dashboard (Next.js)   │◄─────────────────►│  Room per conversation   │
+  │  "Try the agent" page │                   │  noise cancellation      │
+  └──────────┬────────────┘                   │  Egress → recording      │
+             │ HTTPS                          └────────────┬─────────────┘
+             ▼                                             │ WebRTC (agent joins room)
+  ┌─────────────────────────── One VM (Docker Compose, US-East) ─────────────────────────┐
+  │                                                        ▼                             │
+  │  ┌──────────────┐   dispatch    ┌───────────────────────────────────────────────┐   │
+  │  │ API (FastAPI)│──────────────►│ Agent worker (LiveKit Agents, Python)         │   │
+  │  │ - auth       │               │  Silero VAD → Deepgram Flux → turn detector   │   │
+  │  │ - room tokens│◄──tool calls──│       → Claude (custom llm_node) → ElevenLabs │   │
+  │  │ - scheduling │   (HTTP)      │  barge-in, fillers, event log, latency stamps │   │
+  │  │ - config CRUD│               └───────────────────────────────────────────────┘   │
+  │  │ - WhatsApp   │                                                                    │
+  │  └──────┬───────┘                                                                    │
+  │         ▼                                                                            │
+  │  ┌──────────────┐   ┌──────────────┐                                                 │
+  │  │ Postgres 16  │   │ Caddy (TLS)  │                                                 │
+  │  └──────────────┘   └──────────────┘                                                 │
+  └──────────────────────────────────────────────────────────────────────────────────────┘
+       External: Anthropic API · Deepgram · ElevenLabs · Twilio (WhatsApp) · Cloudflare R2 (recordings)
+```
+
+**Why US-East for the VM.** Anthropic, Deepgram and ElevenLabs all serve from US regions. Putting the agent next to them keeps the three per-turn vendor calls fast; the UAE↔US distance is paid once on the audio path (~200–250 ms round trip) instead of on every vendor hop. Phase 3 re-measures an EU region.
+
+**Agent logic calls the API for every tool.** The agent worker holds no business logic. Scheduling rules live in the API, so the dashboard and agent can never disagree, and the logic can be tested without audio.
+
+## 5. Conversation design
+
+### 5.1 Session start
+
+1. The browser asks the API for a room token: `POST /api/demo/{business_slug}/session`.
+2. The API creates the `call` row and returns the token plus room name. It dispatches the agent with metadata `{business_id, config_version, call_id, channel: "web"}`.
+3. The agent loads the business config, starts recording (LiveKit Egress, audio only) and plays the greeting immediately, before any LLM call (pre-rendered and cached per config version):
+   > "Hi, thanks for calling Bright Smile Dental. Just so you know, this call is recorded. How can I help you today?"
+
+### 5.2 Booking flow (happy path)
+
+1. **Intent**: book / reschedule / cancel / question.
+2. **Service**: match to a configured service. If ambiguous, offer at most 3 options.
+3. **Staff preference** (only if the business has more than one staff member for that service): "Do you have a preference for who you see?"
+4. **Time**: ask for a preferred day/time, call `check_availability`, offer **at most 2–3 slots** out loud ("I have Tuesday at 10 a.m. or 2:30 p.m. — which works better?").
+5. **Customer details**: full name, then mobile number. Read the number back in groups ("That's oh-five-oh, one-two-three, four-five-six-seven — correct?"). Normalise to E.164 (`+97150…`).
+6. **Confirm everything** in one sentence: service, staff, day, date, time. Wait for an explicit yes.
+7. `book_appointment` → say the booking is confirmed, and that a WhatsApp confirmation is on its way.
+8. "Anything else I can help with?" → `end_call` after goodbye.
+
+**Reschedule / cancel**: look up by mobile number (`find_appointments`). If more than one booking is found, read the soonest first. Confirm which one, then act.
+
+### 5.3 Speaking style (system prompt rules)
+
+- One or two short sentences per turn; one question at a time.
+- No lists, markdown, URLs or emojis. Write everything as it should be spoken: "two thirty p.m.", "Tuesday the twenty-first", "one hundred and fifty dirhams".
+- Never invent availability, prices or policies; only use tool results and the business config.
+- If unsure what was said, ask once to repeat; after two failed attempts on the same item, offer to take a message.
+- Stay on topic; politely decline unrelated requests.
+- Use British/UAE-friendly English spelling and phrasing. Weekends are Saturday–Sunday unless the business config says otherwise.
+
+### 5.4 Turn-taking and latency tricks
+
+- **End of turn**: Silero VAD + LiveKit turn detector with minimum endpointing delay 300 ms, maximum 1,500 ms. Flux end-of-turn events can shorten the wait.
+- **Barge-in**: caller speech lasting ≥ 250 ms or ≥ 2 words stops agent audio at once and cancels the LLM and TTS streams. Short backchannels ("mm-hm", "okay", "yeah") are ignored while the agent speaks.
+- **Fillers**: if a tool call has not returned in 600 ms, play a cached filler ("One moment, let me check that.") Never play more than one filler per turn.
+- **Preemptive generation**: on (LiveKit `preemptive_generation`). The LLM starts on the interim transcript and the result is discarded if the caller keeps talking.
+- **Silence**: after 8 s of silence, "Are you still there?"; after another 8 s, goodbye and `end_call`.
+- **Max call length**: 10 minutes, then a polite wrap-up.
+
+## 6. Tools (agent → API)
+
+All tools are JSON-schema with `strict: true`, executed by the agent worker over HTTP against the API (`/internal/tools/*`, authenticated with a shared secret). Every result is short, plain JSON that the model can read directly. Every call is logged with latency.
+
+| Tool | Input | Returns | Notes |
+|---|---|---|---|
+| `get_business_info` | `topic` (hours, location, parking, policies, faq) | relevant text | Avoids putting rarely-used FAQs in every prompt |
+| `list_services` | — | `[{id, name, duration_min, price_aed, staff_ids}]` | Also in system prompt if ≤ 20 services |
+| `check_availability` | `service_id`, `date_from`, `date_to` (ISO dates, ≤ 14 days), `staff_id?`, `part_of_day?` (`morning`/`afternoon`/`evening`) | up to 6 slots `[{start, staff_id, staff_name}]`, local time | Server picks well-spread slots |
+| `book_appointment` | `service_id`, `staff_id`, `start`, `customer_name`, `customer_phone` (E.164), `notes?` | `{appointment_id, start, staff_name, service_name}` or error `slot_taken` | Re-checks availability inside a transaction |
+| `find_appointments` | `customer_phone` | upcoming appointments for that number | |
+| `reschedule_appointment` | `appointment_id`, `new_start`, `staff_id?` | updated appointment or `slot_taken` | |
+| `cancel_appointment` | `appointment_id`, `reason?` | `{cancelled: true}` | Respects `cancellation_notice_hours` |
+| `take_message` | `customer_name`, `customer_phone`, `message` | `{saved: true}` | Stands in for "transfer to a human" in the demo; shown in dashboard |
+| `end_call` | `reason` | — | Agent finishes speaking, then disconnects |
+
+**Side-effect guard.** `book_appointment`, `reschedule_appointment` and `cancel_appointment` are only allowed after the orchestrator has seen the model read back the details and the caller say yes. The orchestrator tracks a `confirmed_action` flag in session state, set by a confirmation turn. If the model calls one without confirmation, the tool returns `{"error": "needs_confirmation"}` and the model asks.
+
+WhatsApp confirmations are **not** a tool: the API sends them after any successful book/reschedule/cancel, so the model cannot skip or duplicate them.
+
+## 7. Scheduling engine
+
+### 7.1 Data model (Postgres)
+
+```
+business(id, slug, name, timezone='Asia/Dubai', language='en', config jsonb, config_version, created_at)
+  config: greeting, voice_id, address, parking, policies, faqs[], cancellation_notice_hours,
+          slot_granularity_min=15, buffer_min=0, booking_horizon_days=30, min_notice_hours=2
+service(id, business_id, name, aliases[], duration_min, price_aed, active)
+staff(id, business_id, name, active)
+staff_service(staff_id, service_id)
+working_hours(id, staff_id, weekday 0-6, start_time, end_time)        -- multiple rows = breaks
+time_off(id, staff_id, starts_at, ends_at, reason)
+customer(id, business_id, name, phone_e164, created_at)               -- unique(business_id, phone_e164)
+appointment(id, business_id, service_id, staff_id, customer_id,
+            during tstzrange, status: booked|cancelled|completed|no_show,
+            source: voice|dashboard, call_id, notes, created_at, updated_at)
+  EXCLUDE USING gist (staff_id WITH =, during WITH &&) WHERE (status = 'booked')   -- no double booking
+call(id, business_id, channel, started_at, ended_at, outcome, recording_url, summary)
+call_event(id, call_id, ts, type, payload jsonb)                      -- append-only event log
+message(id, business_id, call_id, customer_name, phone, body, created_at)
+notification(id, appointment_id, channel='whatsapp', status, provider_id, error, created_at)
+```
+
+### 7.2 Availability algorithm
+
+For each eligible staff member and each day in the range:
+
+1. Take that weekday's working-hours windows in the business timezone.
+2. Subtract time off and existing `booked` appointments (each widened by `buffer_min`).
+3. Generate start times on the `slot_granularity_min` grid where `start + duration` fits in a free window.
+4. Drop slots earlier than `now + min_notice_hours` or after the booking horizon.
+5. Return up to 6 slots, spread across days and times of day, matching `part_of_day` if given.
+
+Booking runs in a single transaction. The exclusion constraint is the final guard against double booking: on conflict the tool returns `slot_taken` with 2 alternatives.
+
+### 7.3 Seed data
+
+A `seed/` folder with three example businesses (dental clinic, salon, physiotherapy). A new prospect's business can be created from the dashboard or by copying a seed YAML: `make new-business NAME=... TEMPLATE=dental`.
+
+## 8. Admin dashboard
+
+Next.js (TypeScript), served by the same VM; single admin login (email + password hashed with argon2, session cookie).
+
+| Page | Contents |
 |---|---|
-| Voice-to-voice latency (user stops talking → agent audio starts) | p50 ≤ 800 ms, p95 ≤ 1.5 s |
-| Barge-in (user interrupts → agent stops speaking) | ≤ 200 ms |
-| Channels | PSTN/SIP telephony, WebRTC (web + mobile) |
-| Concurrency | 1,000 simultaneous calls at launch, horizontally scalable |
-| Availability | 99.9% for call acceptance; graceful degradation when a vendor fails |
-| Languages | English at launch; pluggable STT/TTS per language |
-| Compliance | PII redaction in logs, recording consent, configurable retention |
+| **Try the agent** `/try/{slug}` | Big mic button, live captions for both sides, a booking card that appears when a booking is made, optional live latency per turn. Shareable with a prospect via an unguessable link (no login) |
+| **Bookings** | Week/day calendar per staff member; create/edit/cancel manually (source = dashboard) |
+| **Calls** | List with outcome, duration and summary. Detail view shows the transcript with timestamps, audio player, tool calls, and a per-turn latency breakdown (end-of-turn, STT, LLM time to first token, TTS time to first audio) |
+| **Messages** | Messages taken by the agent |
+| **Business settings** | Name, greeting, voice picker with preview, services, staff, working hours, time off, FAQs, policies. Saving bumps `config_version` |
+| **Businesses** | List and create businesses, one per prospect; copy the demo link |
 
-### Non-goals (v1)
+The call summary is generated after the call by `claude-sonnet-5-5`: one paragraph plus an outcome label.
 
-- Training our own speech or language models.
-- Multi-party calls (more than one human speaker).
-- Outbound dialing campaigns.
+## 9. Latency
 
-## 2. Architecture overview
+Measured from the caller stopping speaking to the first agent audio heard in a UAE browser.
 
-The core is a **streaming cascade**: speech-to-text → LLM → text-to-speech, with every stage streaming so stages overlap instead of running one after another. Each provider sits behind an interface, so a vendor can be swapped (or a speech-to-speech model tried) without touching the orchestrator.
+| Stage | Budget p50 |
+|---|---|
+| End-of-turn decision | 300 ms |
+| STT final (overlaps end-of-turn) | 50 ms |
+| Claude time to first sentence (cached prompt) | 400 ms |
+| ElevenLabs time to first audio | 150 ms |
+| UAE ↔ US audio path (both directions) | 230 ms |
+| **Total** | **≈ 1.1 s** |
 
-```
- Caller ──PSTN──► Telephony provider (SIP trunk) ─┐
-                                                  │  audio frames (20 ms, 16 kHz PCM / μ-law)
- Browser/App ──WebRTC──► Media edge (SFU) ────────┤
-                                                  ▼
-                                   ┌──────────────────────────────┐
-                                   │       Session Worker         │  one per active call
-                                   │  ┌────────┐   ┌───────────┐  │
-                         audio in ─┼─►│  VAD + │──►│ Streaming │──┼──► partial / final transcripts
-                                   │  │  turn  │   │    STT    │  │
-                                   │  │ detect │   └───────────┘  │
-                                   │  └───┬────┘         │        │
-                                   │      │ barge-in     ▼        │
-                                   │      │      ┌──────────────┐ │      ┌──────────────┐
-                                   │      │      │ Dialogue     │◄┼─────►│ Tool gateway │──► CRM, calendar,
-                                   │      │      │ orchestrator │ │      └──────────────┘    orders, KB (RAG)
-                                   │      │      │ (LLM, state) │ │
-                                   │      │      └──────┬───────┘ │
-                                   │      │   token stream│        │
-                                   │      ▼             ▼        │
-                        audio out ◄┼── Playout ◄── Streaming TTS   │
-                                   │   buffer   (sentence chunks) │
-                                   └──────────────┬───────────────┘
-                                                  │ events
-                         ┌────────────────────────┼─────────────────────────┐
-                         ▼                        ▼                         ▼
-                   Session store             Event log /              Metrics & traces
-                   (Redis)                   transcripts (Postgres,   (OpenTelemetry)
-                                             object storage)
-```
+**Targets**: p50 ≤ 1.2 s, p95 ≤ 2.0 s, barge-in stop ≤ 250 ms.
 
-### Control plane vs. data plane
+**Latency gate (end of Phase 1).** Run 50 scripted turns. Then:
+- If Claude's p50 time to first token is over 600 ms with caching and fast mode, switch the turn model to `claude-sonnet-5-5`.
+- If total p50 is over 1.4 s, try an EU-region VM and Cartesia for text-to-speech.
 
-- **Data plane** — Session Workers. Stateful, latency-critical, hold one live call each (many per process via async I/O). Pinned to a call for its whole lifetime.
-- **Control plane** — stateless API services: agent configuration (prompts, voices, tools), call routing, admin dashboard, analytics. Not on the latency path.
+Every turn writes latency stamps into `call_event`, so the dashboard shows the real numbers.
 
-## 3. Components
+## 10. WhatsApp confirmations
 
-### 3.1 Transport / media ingress
+- Twilio WhatsApp API. **Until a company is registered: Twilio WhatsApp Sandbox.** Recipients first send the sandbox join code, which suits demos to prospects on their own phones. After registration: a Meta-verified WhatsApp Business sender with approved templates.
+- Template (utility): "Hi {name}, your {service} with {staff} at {business} is confirmed for {day, date} at {time}. To change it, just call us back." Similar templates for rescheduled and cancelled.
+- Sent asynchronously by the API after commit; result stored in `notification`. A failure never affects the call.
 
-- **Telephony**: a SIP trunk / programmable voice provider streams call audio to us over a bidirectional WebSocket (8 kHz μ-law). We resample to 16 kHz for STT.
-- **WebRTC**: a media SFU (e.g. LiveKit-style) terminates WebRTC, giving echo cancellation, jitter buffering, and Opus from the client. The Session Worker joins the room as a participant.
-- A **Media Adapter** interface normalises both into a stream of 20 ms PCM frames in and out, so nothing downstream knows which channel the call came from.
+## 11. Recording, data and privacy (demo level)
 
-### 3.2 Voice activity detection and turn detection
+- Greeting includes the recording notice (D12). Recording: LiveKit Egress, audio only, OGG to Cloudflare R2 (private bucket). Played back in the dashboard through short-lived signed URLs.
+- Secrets live in `.env` on the VM, never in the repo. The dashboard is HTTPS only, through Caddy.
+- Retention: recordings and transcripts are deleted after 30 days by a nightly job. Prospects' demo data can be wiped per business.
+- Deferred to production: UAE PDPL review, DHA/DOH rules for clinics, data residency in the UAE, consent records, PII redaction.
 
-Getting turn-taking right matters more than any other single factor for how natural the agent feels.
-
-- **VAD** (small on-device model, e.g. Silero-class) runs on every frame: speech / not-speech.
-- **End-of-turn detection** combines:
-  1. Silence duration after speech (base threshold ~500 ms, adaptive).
-  2. A **semantic end-of-turn model** over the partial transcript ("I want to book for…" → not done; "Yes, that's right." → done). This lets the silence threshold drop to ~200 ms when the utterance is clearly complete, and stretch to ~1.2 s when it clearly isn't.
-- **Speculative start**: when end-of-turn probability crosses a lower threshold, the orchestrator starts the LLM call early on the current transcript. If the user keeps talking, the speculative response is cancelled and discarded before any audio plays.
-
-### 3.3 Barge-in (interruption)
-
-While the agent is speaking:
-
-1. VAD fires on user speech that lasts longer than ~150 ms (filters coughs and "mm-hm" backchannels; a short list of backchannel words can be ignored outright).
-2. The Playout buffer is flushed immediately and TTS + LLM streams are cancelled.
-3. The orchestrator records **what the user actually heard**: the conversation history keeps the assistant message truncated at the last word that was played (tracked through TTS word timestamps), not the full generated text. Otherwise the agent "remembers" saying things the user never heard.
-
-Telephony echo: the agent's own voice can leak back into the inbound audio. Rely on WebRTC AEC for app calls; for phone calls, gate VAD sensitivity while the agent speaks and use the provider's echo cancellation where available.
-
-### 3.4 Speech-to-text (STT)
-
-- Streaming STT with **partial** (interim) and **final** results; partials drive turn detection and speculative LLM calls.
-- Custom vocabulary / keyword boosting per agent (product names, account terms).
-- Interface:
-
-```python
-class STT(Protocol):
-    async def stream(self, frames: AsyncIterator[bytes], lang: str) -> AsyncIterator[TranscriptEvent]: ...
-    # TranscriptEvent: text, is_final, confidence, start_ms, end_ms
-```
-
-### 3.5 Dialogue orchestrator
-
-The brain of a session. A per-call async state machine:
-
-```
-LISTENING ──end of turn──► THINKING ──first audio──► SPEAKING ──playout done──► LISTENING
-    ▲                          │                         │
-    └──────── barge-in ────────┴──────── barge-in ───────┘
-```
-
-Responsibilities:
-
-- Build the LLM request: system prompt (persona, policies, voice style rules), conversation history, relevant retrieved context, available tools.
-- **Stream** the LLM output; forward text to TTS sentence by sentence as soon as each clause is complete.
-- Run the tool loop: when the model calls a tool, execute it through the Tool Gateway, feed the result back, continue. If a tool will take more than ~700 ms, play a short filler ("Let me check that for you…") so there is no dead air.
-- Maintain structured **session state** (caller identity, collected slots, current task) alongside raw history, so long calls can summarise old turns without losing key facts.
-- Enforce guardrails (see §7) and decide on **escalation to a human** (explicit request, repeated failure to understand, sensitive topics).
-
-**Model choice.** Latency dominates, so the default turn model is a fast model (e.g. `claude-haiku-5-5`) with streaming and prompt caching on the static system prompt + tool definitions to cut time-to-first-token. Agents that need harder reasoning can be configured to use a larger model (e.g. `claude-sonnet-5-5`), accepting higher latency, or to route only complex turns to it.
-
-**Voice-specific prompting.** Responses are spoken, not read: short sentences, no markdown/lists/URLs, numbers and dates written to be read aloud, one question at a time, confirm critical values ("That's 4-1-5, 5-5-5, 0-1-9-9 — correct?").
-
-### 3.6 Tool gateway
-
-- Agents declare tools as JSON-schema functions; the gateway owns the actual integrations (CRM, calendar, order DB, payments handoff, knowledge-base search).
-- Per-tool timeout, retries, and circuit breaker; every call is logged with arguments (PII-redacted) and latency.
-- **Side-effecting tools** (book, cancel, refund) require the model to have read back and confirmed the details with the caller in the conversation; the gateway can enforce this with a `requires_confirmation` flag checked against session state.
-- **Knowledge base (RAG)**: documents chunked and embedded into a vector index; retrieval exposed as a `search_knowledge_base` tool rather than stuffed into every turn, so we only pay its latency when needed.
-
-### 3.7 Text-to-speech (TTS)
-
-- Streaming TTS that accepts text incrementally and returns audio chunks plus **word-level timestamps** (needed for barge-in truncation).
-- Text normaliser before TTS: expand abbreviations, currency, phone numbers, times.
-- Voice, speed, and pronunciation lexicon configured per agent.
-- Common phrases (greetings, fillers, "one moment") pre-rendered and cached.
-
-### 3.8 Playout buffer
-
-Paces audio frames out in real time, tracks the playback cursor (what the user has heard so far), and supports instant flush on barge-in.
-
-### 3.9 Alternative: speech-to-speech models
-
-Native audio-in/audio-out models can cut latency further and keep prosody, but give less control over turn detection, tool reliability, transcripts for compliance, and per-stage vendor choice. The `Pipeline` interface allows a `SpeechToSpeechPipeline` implementation to be A/B-tested against the cascade per agent; the cascade is the v1 default.
-
-## 4. Latency budget
-
-Voice-to-voice, from the moment the user stops speaking:
-
-| Stage | Budget (p50) | Notes |
-|---|---|---|
-| End-of-turn decision | 200–300 ms | Semantic model lets us cut silence wait |
-| STT final transcript | ~100 ms | Mostly overlapped with turn detection |
-| LLM time to first sentence | 250–350 ms | Fast model, prompt caching, speculative start |
-| TTS time to first audio | 100–150 ms | Streaming, first clause only |
-| Network + jitter buffer | 50–100 ms | Co-locate workers with media edge and vendors |
-| **Total** | **~700–900 ms** | |
-
-Rules that keep us inside it: stream everything, start each stage on partial input from the previous one, keep vendors in the same region as Session Workers, keep persistent connections to STT/LLM/TTS warm, and never block the audio loop on logging or analytics (fire events to a queue).
-
-## 5. Data and state
-
-| Data | Store | Lifetime |
-|---|---|---|
-| Live session state (turn state, slots, history) | In worker memory, checkpointed to Redis every turn | Call duration (+ short TTL for reconnects) |
-| Agent configs (prompt, voice, tools, model) | Postgres, versioned; cached in workers | Permanent, every change versioned |
-| Call records, transcripts, tool calls, metrics | Postgres (metadata) + object storage (transcripts) | Per retention policy (default 90 days) |
-| Recordings | Object storage, encrypted, only with consent | Per retention policy |
-| Knowledge-base embeddings | Vector index | Rebuilt on document change |
-
-Every call writes an append-only **event log** (`call.started`, `turn.user_final`, `llm.first_token`, `tool.called`, `tts.first_audio`, `barge_in`, `call.ended`, …). Transcripts, analytics, and latency dashboards are all derived from it.
-
-## 6. Scaling and deployment
-
-- Session Workers run as containers on Kubernetes, autoscaled on **active sessions per pod** (not CPU). Each pod handles ~50–100 concurrent calls since the heavy work happens at vendors; VAD/turn models are small enough for CPU.
-- A **call router** assigns new calls to the least-loaded worker; a call stays on its worker for its lifetime.
-- **Draining**: on deploy, a pod stops accepting new calls and exits once its calls finish (max ~30 min drain), so deploys never drop live calls.
-- Multi-region: route callers to the nearest region; each region has its own workers, Redis, and vendor endpoints.
-- If a worker dies mid-call, the router restarts the session on a new worker from the last Redis checkpoint; the agent apologises briefly and continues.
-
-## 7. Safety, privacy, and guardrails
-
-- **Recording consent** announced at call start where legally required; recording disabled otherwise.
-- **PII redaction** (card numbers, SSNs, etc.) on transcripts before they are stored or logged. Payment details are never handled by the LLM — hand off to a PCI-compliant DTMF/IVR payment flow.
-- **Authentication** before account-specific actions (verify caller via OTP or known details), tracked as a flag in session state that the Tool Gateway checks.
-- **Prompt-injection hygiene**: tool results and KB content are treated as data; side-effecting tools are gated by confirmation and auth flags, not by model judgement alone.
-- **Human handoff**: warm transfer to a live agent queue with a generated summary of the call so the caller doesn't repeat themselves.
-- Hard limits: max call duration, max consecutive tool failures, abuse detection → polite end of call.
-
-## 8. Failure handling
+## 12. Failure handling
 
 | Failure | Behaviour |
 |---|---|
-| STT/TTS vendor errors or slow | Circuit breaker fails over to secondary vendor |
-| LLM timeout (> 3 s to first token) | Play filler, retry once on fallback model, then offer human transfer |
-| Tool failure | Model is told the tool failed and apologises / offers alternative; never invents results |
-| Low STT confidence | Ask the caller to repeat or confirm, instead of guessing |
-| Repeated misunderstanding (3 turns) | Offer human transfer |
-| Worker crash | Resume from Redis checkpoint on another worker |
+| Claude slow (> 2.5 s to first token) or 5xx | Play filler, retry once without fast mode, then once on `claude-sonnet-5-5`; then "Sorry, I'm having trouble — can I take a message?" |
+| Refusal (`stop_reason: "refusal"`) | Server-side fallback; if it still refuses, steer back to booking |
+| Deepgram / ElevenLabs error | LiveKit `FallbackAdapter` → AssemblyAI / Cartesia |
+| Tool / API error | Model receives `is_error` result and apologises; never invents a booking |
+| `slot_taken` | Offer the 2 alternatives returned |
+| WhatsApp send fails | Logged; dashboard shows "not delivered"; call unaffected |
+| Agent worker crash | Browser shows "connection lost — try again"; call marked `failed` |
 
-## 9. Observability and evaluation
+## 13. Observability and evaluation
 
-**Per-turn metrics**: end-of-turn delay, STT latency, LLM TTFT, TTS TTFA, voice-to-voice latency, barge-in count, tool latency/error rate. One OpenTelemetry trace per call, one span per stage per turn.
+- **Logs**: structured JSON (structlog) with `call_id` on every line. **Metrics**: the per-turn stamps in `call_event`, plus a dashboard latency chart. **Errors**: Sentry, free tier.
+- **Scenario evals** (`evals/`): 25 scripted scenarios run through the real pipeline, including the audio, using a simulated caller (`claude-sonnet-5-5` + TTS):
+  - simple booking; booking with no staff preference; requested time unavailable; caller changes their mind mid-way;
+  - interruptions during slot offers; mumbled or corrected phone number; reschedule; cancel inside the notice window;
+  - unrelated question; caller asks for a human; silence; background noise.
+- **Judge** (`claude-opus-5-5`, effort high) scores each run on:
+  1. task completed correctly (checked against the database);
+  2. no hallucinated slots or prices;
+  3. confirmation before side effects;
+  4. concise, spoken style;
+  5. latency within target.
+- Run on every prompt or config change. Gate: ≥ 90% pass, no hallucination failures.
 
-**Per-call outcomes**: task completed, transferred to human, abandoned, call duration, caller sentiment.
-
-**Evaluation**:
-- **Offline**: a library of scripted conversations replayed through the pipeline using a **simulated caller** (an LLM playing a persona, speaking via TTS so the full audio path is exercised, including accents, background noise and interruptions). An LLM judge scores each call against a rubric (task success, policy adherence, tone, no hallucinated facts). Run on every prompt/config change as a regression gate.
-- **Online**: sample real calls for human review; A/B test prompt, model, and voice changes by agent config version.
-
-## 10. Proposed repository layout
+## 14. Repository layout
 
 ```
 voice-agent/
-├── docs/                    # this design, ADRs
-├── services/
-│   ├── session-worker/      # data plane: pipeline, orchestrator, media adapters
-│   │   ├── media/           # telephony + WebRTC adapters, playout buffer
-│   │   ├── turn/            # VAD, end-of-turn model, barge-in
-│   │   ├── providers/       # STT, LLM, TTS interfaces + vendor implementations
-│   │   ├── orchestrator/    # state machine, prompt building, tool loop
-│   │   └── tests/
-│   ├── call-router/         # assigns calls to workers
-│   ├── tool-gateway/        # integrations, auth/confirmation gating
-│   └── control-api/         # agent config CRUD, call records, analytics API
-├── web/                     # admin dashboard + web/mobile client SDK
-├── evals/                   # simulated callers, scenarios, judge rubrics
-└── infra/                   # Kubernetes manifests, Terraform
+├── docs/DESIGN.md
+├── agent/                     # LiveKit Agents worker (Python 3.12, uv)
+│   ├── main.py                # entrypoint, AgentSession setup
+│   ├── llm_claude.py          # custom llm_node using anthropic SDK
+│   ├── prompts/               # system prompt template, fillers
+│   ├── tools.py               # tool schemas + HTTP calls to API
+│   ├── confirmation.py        # side-effect guard
+│   ├── telemetry.py           # latency stamps → call_event
+│   └── tests/
+├── api/                       # FastAPI + SQLAlchemy 2 + Alembic
+│   ├── app/routes/            # demo sessions, tools, dashboard CRUD, auth
+│   ├── app/scheduling/        # availability, booking (pure functions, heavily tested)
+│   ├── app/notify/whatsapp.py
+│   ├── migrations/
+│   └── tests/
+├── dashboard/                 # Next.js 15 + @livekit/components-react + Tailwind
+├── evals/                     # simulated caller, scenarios, judge rubric
+├── seed/                      # example businesses (YAML)
+├── deploy/                    # docker-compose.yml, Caddyfile, .env.example
+└── Makefile                   # dev, test, seed, eval, deploy
 ```
 
-Suggested stack: Python (asyncio) for the session worker — the best ecosystem for audio/ML and vendor SDKs; TypeScript for the dashboard and client SDK.
+## 15. Environments and cost
 
-## 11. Roadmap
+- **Local dev**: `docker compose up` (Postgres, API, dashboard) + `uv run agent/main.py dev` against a LiveKit Cloud dev project.
+- **Demo server**: one VM (2 vCPU / 4 GB, Ubuntu 24.04, US-East, e.g. Hetzner Ashburn or DigitalOcean NYC) running Docker Compose; deploy by `make deploy` (rsync + `docker compose up -d`). Domain with HTTPS through Caddy.
+- **Estimated running cost** (to be verified against live pricing):
+  - Fixed: VM ~$10–25/month; LiveKit Cloud, Sentry and R2 on free tiers at demo volume.
+  - Per conversation minute, roughly $0.06–0.15 (ElevenLabs is the largest share, then Deepgram and Claude). Claude stays cheap thanks to cache reads at $0.20 per million tokens.
 
-1. **Phase 1 — Walking skeleton (2–3 wks)**: WebRTC only, one STT/LLM/TTS vendor each, silence-based turn detection, barge-in, a single hard-coded agent, call logging. Goal: measure real end-to-end latency.
-2. **Phase 2 — Useful agent (3–4 wks)**: tool gateway with 2–3 integrations, RAG knowledge base, semantic turn detection, speculative LLM start, agent config in the control API.
-3. **Phase 3 — Phone + production (4 wks)**: telephony adapter, human handoff, PII redaction, consent, failover vendors, autoscaling and draining, dashboards.
-4. **Phase 4 — Quality loop (ongoing)**: simulated-caller eval suite as CI gate, A/B testing, speech-to-speech pipeline experiment, more languages.
+## 16. Roadmap and acceptance criteria
 
-## 12. Open questions
+**Phase 1 — Talking skeleton (week 1–2)**
+- Agent in a LiveKit room with Flux → Claude → ElevenLabs, barge-in, greeting, end of call; plain test page.
+- Speech-to-text and text-to-speech bake-off; latency gate (§9).
+- ✅ Done when: a 3-minute conversation works with p50 ≤ 1.4 s and barge-in works reliably.
 
-1. Primary use case and first customer — support line, appointment booking, sales qualification? This drives which tools come first.
-2. Which channel matters most at launch: phone or app?
-3. Build on a voice-agent framework (e.g. LiveKit Agents, Pipecat) versus our own pipeline? Recommendation: use a framework for media transport and the pipeline plumbing in Phase 1, keep our own orchestrator and turn logic behind interfaces.
-4. Hosting constraints (cloud, region, data residency) and compliance scope (HIPAA, PCI, GDPR).
-5. Budget per call-minute — this decides vendor tiers and how often larger models can be used.
+**Phase 2 — Bookable demo (week 3–5)**
+- Scheduling engine and tools; database; seed businesses; WhatsApp Sandbox; recording; dashboard (all §8 pages); 25-scenario eval suite; deploy to VM.
+- ✅ Done when: a prospect can open `/try/{slug}`, book an appointment by voice, get a WhatsApp confirmation, and the admin sees booking, transcript, recording and latency. Eval pass rate ≥ 90%. p50 ≤ 1.2 s from a UAE network.
+
+**Phase 3 — Phone (after company registration)**
+- Telnyx `+971` number → LiveKit SIP inbound trunk; 8 kHz telephony tuning; re-measure EU vs US region; verified WhatsApp Business sender.
+
+**Phase 4 — Arabic**
+- Gulf Arabic speech-to-text bake-off (Deepgram, ElevenLabs Scribe, Speechmatics); ElevenLabs Arabic voice; language auto-detect at greeting; bilingual prompts and number reading.
+
+## 17. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Browser voice (WebRTC) blocked or degraded on some UAE networks | Test on e& and du mobile data and home broadband in Phase 1; LiveKit falls back to TURN over TLS on port 443. If still blocked, prioritise Phase 3 (phone) |
+| Opus 5.5 too slow for conversation | Latency gate switches to Sonnet 5.5 with no other changes |
+| Speech-to-text gets UAE names and accents wrong | Keyterm boosting from staff and service names; always read back name and number; bake-off on accented samples |
+| WhatsApp Sandbox needs recipients to opt in first | Explain in the demo script; register a business sender after company registration |
+| Twilio cannot provide UAE voice numbers | Phase 3 uses Telnyx (or a local e&/du SIP trunk) |
